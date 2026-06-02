@@ -4,9 +4,9 @@ description: >
   让 Claude Code 通过微信收发消息的桥接配置 skill。基于微信官方 ClawBot 接口 + 第三方 npm 包
   claude-wechat-channel（fengliu222 维护）。当用户说"把 Claude 连到微信" / "想用手机微信和
   Claude 聊" / "ClawBot 配 Claude" / "claude-wechat-channel 怎么装" 时触发。
-version: 1.1.0
+version: 1.2.0
 risk_level: 中（第三方维护 + 微信新号绑定 + dangerously flag）
-tested_on: 2026-05-24, macOS 26.4, Claude Code 2.1.128, claude-wechat-channel@0.1.2（含图片文件补丁）
+tested_on: 2026-06-02, macOS 26.4, Claude Code 2.1.150, claude-wechat-channel@0.1.2（含图片文件补丁 + 主动发送 wsend.js）
 ---
 
 # Claude Code ↔ 微信 桥接配置 Skill
@@ -15,7 +15,8 @@ tested_on: 2026-05-24, macOS 26.4, Claude Code 2.1.128, claude-wechat-channel@0.
 
 让 Claude Code（CLI）能：
 - **收**：用户在手机微信「微信 ClawBot」对话发的消息，自动当成 prompt 进 Claude
-- **发**：Claude 主动调 `mcp__wechat__reply` 工具回消息到那个对话
+- **回**：Claude 调 `mcp__wechat__reply` 工具**回复**用户消息（需先收到入站拿 user_id）
+- **主动发**：Claude 用本 skill 自带的 `wsend.js` **主动**推消息到用户微信，**无需用户先发消息**（v1.2.0 新增，见下文「主动发送」）
 
 典型用例：
 - 让 AI 帮你跟踪一个长流程，过程中你不在电脑前但需要随时给输入
@@ -99,10 +100,51 @@ pkill -f claude-wechat-channel
 - ✓ PDF（pypdf 抽文本；图片型 PDF 需要 `brew install poppler` 才能用 Read 直接看）
 
 **已知限制：**
-- 微信 ClawBot 接口本身不支持 Claude 主动给用户发图片/文件，**单向**（只能收，不能发）
+- 入站方向（收图片/文件）已打通；**主动发图片/文件**暂未验证（媒体发送要走 getuploadurl，可能仍依赖入站 context_token）。**主动发纯文本已验证可行**，见下文「主动发送」
 - 文件名中如有特殊字符（中文括号等）落盘时会保留，path 传给工具需注意 quoting
 
-## 在 Claude 这边用 `mcp__wechat__reply`
+## 主动发送（wsend.js）— v1.2.0 新增
+
+**解决的痛点：** 官方 `mcp__wechat__reply` 工具只能「响应」——它在发送前会查 `getContextToken(user_id)`，
+而 contextToken 只在**收到入站消息时**才进内存。所以 Claude **没法主动发起对话**（比如「长任务跑完了主动
+通知你」「定时把结果推给你」），必须用户先发一条才能回。
+
+**突破口：** 扒了 `claude-wechat-channel` 源码后发现，底层 ilink 接口 `POST {baseUrl}/ilink/bot/sendmessage`
+**接受不带 `context_token` 的纯文本消息**——也就是 bot 可以主动发起。reply 的「必须先入站」是 npm 包 wrapper
+自己加的保护，不是接口硬限制。`wsend.js` 直接复用账号凭证打这个接口，绕开 wrapper，实现真·主动发送。
+
+**已验证（2026-06-02）：** 不带 context、无任何入站，直接 `node wsend.js` → 用户手机微信**实收**。
+
+### 用法
+
+```bash
+# 发给凭证里的默认 userId（即扫码登录的那个号自己）
+node ~/.claude/skills/claude-wechat-bridge/wsend.js "任务跑完了，结果在桌面 result.html"
+
+# 长文 / 含特殊字符 → 走 stdin，免 shell 转义
+node ~/.claude/skills/claude-wechat-bridge/wsend.js - < message.txt
+
+# 指定接收人
+node ~/.claude/skills/claude-wechat-bridge/wsend.js --to <userId> "文字"
+```
+
+超 4000 字自动分段。退出码：`0` 成功 / `1` 用法或凭证错 / `2` 发送失败（看 stderr 的 status + raw）。
+
+### 它怎么找凭证 / 接收人
+
+- 凭证：自动读 `~/.wechat-claude/accounts/*.json`，取第一个含 `token` + `baseUrl` 的（字段：`token` / `baseUrl` / `userId` / `accountId`）
+- 默认接收人：凭证里的 `userId`（= 扫码绑定的那个微信号本人）。要发给别人用 `--to`
+- 可选 `~/.wechat-claude/last-context.json`：若存在则带上 contextToken（更稳妥），没有也能发
+
+### 典型用法：长任务主动汇报
+
+```
+跑批量活 → 中途/收尾节点 → node wsend.js "进度：X/Y 完成，卡在 Z" → 用户手机收到
+```
+
+这让「人不在电脑前，AI 主动找你」成立，而不只是「人先问、AI 才答」。
+
+## 在 Claude 这边用 `mcp__wechat__reply`（响应已有对话）
 
 ```python
 mcp__wechat__reply(
@@ -111,8 +153,11 @@ mcp__wechat__reply(
 )
 ```
 
-**关键约束：** `reply` 只能"响应"——必须先收到用户消息拿到 user_id，才能 reply 给同一个会话。
-**不能主动发起对话**（除非缓存了之前的 user_id）。
+**和 wsend.js 的分工：**
+- 用户**刚发了消息** → 用 `mcp__wechat__reply`（有现成 user_id，且自动 markdown→纯文本）
+- 用户**没发消息、你要主动推** → 用 `wsend.js`（不需要入站）
+
+`reply` 仍受「必须先收到入站拿 user_id」约束；要主动发起一律走 `wsend.js`。
 
 ## 已知坑 + 解决
 
@@ -152,6 +197,9 @@ ls ~/.npm/_npx/*/node_modules/claude-wechat-channel/data/ 2>/dev/null
 # 强制重新登录(用新二维码)
 rm -rf ~/.npm/_npx/*/node_modules/claude-wechat-channel/data/
 # 重启 claude --dangerously-load-development-channels server:wechat
+
+# 验证主动发送(给自己发一条测试)
+node ~/.claude/skills/claude-wechat-bridge/wsend.js "wsend 自测 ✅"
 ```
 
 ## 参考链接
